@@ -1,0 +1,15 @@
+{application, beam_disassemble,
+ [{description, "BEAM file disassembler"},
+  {vsn, "0.1.0"},
+  {registered, []},
+  {applications,
+   [kernel,
+    stdlib
+   ]},
+  {env,[]},
+  {modules, [beam_disassemble]},
+
+  {maintainers, []},
+  {licenses, []},
+  {links, []}
+ ]}.
