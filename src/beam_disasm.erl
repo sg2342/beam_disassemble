@@ -33,8 +33,8 @@
 
 -author("Kostis Sagonas").
 
--include("beam_opcodes.hrl").
--include("beam_disasm.hrl").
+-include_lib("compiler/src/beam_opcodes.hrl").
+-include_lib("compiler/src/beam_disasm.hrl").
 
 %%-----------------------------------------------------------------------
 

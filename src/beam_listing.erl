@@ -21,7 +21,7 @@
 
 -export([module/2]).
 
--include("v3_life.hrl").
+-include_lib("compiler/src/v3_life.hrl").
 
 -import(lists, [foreach/2]).
 
