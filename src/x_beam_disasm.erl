@@ -23,7 +23,7 @@
 %%      inserted at the end of function resolve_inst().
 %%=======================================================================
 
--module(beam_disasm).
+-module(x_beam_disasm).
 
 -export([file/1]). %% the main function
 -export([function__code/1, format_error/1]).
