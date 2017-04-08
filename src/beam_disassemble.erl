@@ -22,7 +22,7 @@ do2({ok, Out}, Args) ->
 
 fix_exp({F, A,_L}) -> {F,A}.
 
-count_labels(Code) -> count_labels(Code, 1).
+count_labels(Code) -> count_labels(Code, 0).
 
 count_labels([], Acc) -> Acc;
 count_labels(label, Acc) -> Acc + 1;
