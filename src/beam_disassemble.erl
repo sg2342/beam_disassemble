@@ -5,6 +5,8 @@
 
 -define(EXT, ".S").
 
+-include("x_beam_disasm.hrl").
+
 main(L) ->
     HandleResult = maybe_delete_s(os:getenv("HUNT_REGRESSIONS")),
     lists:foreach(
@@ -24,8 +26,9 @@ maybe_delete_s(_) ->
 do(BeamFile) -> do1(x_beam_disasm:file(BeamFile)).
 
 do1({error, _, _} = E) -> E;
-do1({beam_file, Mod, Exp0, Attr, _Info, NumLabels, Code}) ->
+do1({beam_file, Mod, Exp0, Attr0, _Info, NumLabels, Code0}) ->
     Exp = lists:map(fun fix_exp/1, Exp0),
+    {Attr, Code} = fix_on_load(Attr0, Code0),
     MaybeOk = file:open(atom_to_list(Mod) ++ ?EXT,
 			[write]),
     do2(MaybeOk, {Mod, Exp, Attr, Code, NumLabels}).
@@ -38,3 +41,17 @@ do2({ok, Out}, {Mod, _, _, _, _} = Args) ->
     compile:file(Mod, [from_asm, strong_validation, verbose, return]).
 
 fix_exp({F, A,_L}) -> {F,A}.
+
+fix_on_load(Attr, Code) ->
+    MaybeEmpty =
+	lists:filter(
+	  fun(#function{code = C}) -> lists:member(on_load, C) end, Code),
+    fix_on_load(MaybeEmpty, Attr, Code, []).
+
+fix_on_load([], Attr, Code, []) -> {Attr, Code};
+fix_on_load([], Attr0, Code, L) -> {[{on_load, L}| Attr0], Code};
+fix_on_load([#function{name = Name, arity = Arity, code = C} = F | T],
+	    Attr, Code0, Acc) ->
+    Code = lists:keyreplace(Name, #function.name, Code0,
+			    F#function{code = lists:delete(on_load, C)}),
+    fix_on_load(T, Attr, Code, [{Name, Arity}|Acc]).
