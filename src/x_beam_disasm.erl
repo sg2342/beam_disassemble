@@ -34,7 +34,7 @@
 -author("Kostis Sagonas").
 
 -include_lib("compiler/src/beam_opcodes.hrl").
--include_lib("compiler/src/beam_disasm.hrl").
+-include("x_beam_disasm.hrl").
 
 %%-----------------------------------------------------------------------
 
@@ -182,8 +182,14 @@ process_chunks(F) ->
 	    Lambdas = beam_disasm_lambdas(LambdaBin, Atoms),
 	    LiteralBin = optional_chunk(F, "LitT"),
 	    Literals = beam_disasm_literals(LiteralBin),
-	    Code = beam_disasm_code(CodeBin, Atoms, mk_imports(ImportsList),
-				    StrBin, Lambdas, Literals, Module),
+	    Lines =
+		case optional_chunk(F, "Line") of
+		    none -> undefined;
+		    LinesBin when is_binary(LinesBin) ->
+			x_beam_util:lines_of_bin(LinesBin, Module)
+		end,
+	    {NumLabels, Code} = beam_disasm_code(CodeBin, Atoms, mk_imports(ImportsList),
+				    StrBin, Lambdas, Literals, Lines, Module),
 	    Attributes =
 		case optional_chunk(F, attributes) of
 		    none -> [];
@@ -199,6 +205,7 @@ process_chunks(F) ->
 		       labeled_exports = Exports,
 		       attributes = Attributes,
 		       compile_info = CompInfo,
+		       num_labels = NumLabels,
 		       code = Code};
 	Error -> Error
     end.
@@ -257,16 +264,22 @@ beam_disasm_code(<<_SS:32, % Sub-Size (length of information before code)
 		  _OM:32,  % Opcode Max
 		  _L:32,_F:32,
 		  CodeBin/binary>>, Atoms, Imports,
-		 Str, Lambdas, Literals, M) ->
+		 Str, Lambdas, Literals, Lines, M) ->
     Code = binary_to_list(CodeBin),
     try disasm_code(Code, Atoms, Literals) of
 	DisasmCode ->
 	    Functions = get_function_chunks(DisasmCode),
+	    NumLabels = length(lists:filter(
+				 fun({label,_}) -> true;
+				    (_) -> false end,
+				 DisasmCode)),
 	    Labels = mk_labels(local_labels(Functions)),
-	    [function__code_update(Function,
-				   resolve_names(Is, Imports, Str,
-						 Labels, Lambdas, Literals, M))
-	     || Function = #function{code=Is} <- Functions]
+	    {NumLabels + 1,
+	     [function__code_update(Function,
+				    resolve_names(Is, Imports, Str,
+						  Labels, Lambdas, Literals,
+						  Lines, M))
+	      || Function = #function{code=Is} <- Functions]}
     catch
 	error:Rsn ->
 	    ?NO_DEBUG('code disassembling failed: ~p~n', [Rsn]),
@@ -313,12 +326,16 @@ get_funs({_,[]}) ->
 get_funs({LsR0,[{func_info,[{atom,M}=AtomM,{atom,F}=AtomF,ArityArg]}|Code0]})
   when is_atom(M), is_atom(F) ->
     Arity = resolve_arg_unsigned(ArityArg),
+    LsR1 = case LsR0 of
+	       [{line, _},{label, _}] -> lists:reverse(LsR0);
+	       _ -> LsR0
+	   end,
     {LsR,Code,RestCode} = get_fun(Code0, []),
     [{label,[{u,Entry}]}|_] = Code,
     [#function{name=F,
 	       arity=Arity,
 	       entry=Entry,
-	       code=lists:reverse(LsR0, [{func_info,AtomM,AtomF,Arity}|Code])}
+	       code=lists:concat([LsR1, [{func_info,AtomM,AtomF,Arity}|Code]])}
      |get_funs({LsR,RestCode})].
 
 get_fun([{func_info,_}|_]=Is, R0) ->
@@ -643,8 +660,8 @@ decode_tag(?tag_z) -> z.
 %%  representation means it is simpler to iterate over all args, etc.
 %%-----------------------------------------------------------------------
 
-resolve_names(Fun, Imports, Str, Lbls, Lambdas, Literals, M) ->
-    [resolve_inst(Instr, Imports, Str, Lbls, Lambdas, Literals, M) || Instr <- Fun].
+resolve_names(Fun, Imports, Str, Lbls, Lambdas, Literals, Lines, M) ->
+    [resolve_inst(Instr, Imports, Str, Lbls, Lambdas, Literals, Lines, M) || Instr <- Fun].
 
 %%
 %% New make_fun2/4 instruction added in August 2001 (R8).
@@ -652,379 +669,387 @@ resolve_names(Fun, Imports, Str, Lbls, Lambdas, Literals, M) ->
 %% the clause for every instruction.
 %%
 
-resolve_inst({make_fun2,Args}, _, _, _, Lambdas, _, M) ->
+resolve_inst({make_fun2,Args}, _, _, _, Lambdas, _, _, M) ->
     [OldIndex] = resolve_args(Args),
-    {OldIndex,{F,A,_Lbl,_Index,NumFree,OldUniq}} =
+    {OldIndex,{F,A,Lbl,_Index,_NumFree,_OldUniq}} =
 	lists:keyfind(OldIndex, 1, Lambdas),
-    {make_fun2,{M,F,A},OldIndex,OldUniq,NumFree};
-resolve_inst(Instr, Imports, Str, Lbls, _Lambdas, _Literals, _M) ->
+    {comment,
+     {make_fun2,{f,Lbl}, 0, 0, 0},
+     {M,F,A}};
+resolve_inst(Instr, Imports, Str, Lbls, _Lambdas, _Literals, Lines, _M) ->
     %% io:format(?MODULE_STRING":resolve_inst ~p.~n", [Instr]),
-    resolve_inst(Instr, Imports, Str, Lbls).
+    resolve_inst(Instr, Imports, Str, Lbls, Lines).
 
-resolve_inst({label,[{u,L}]},_,_,_) ->
+resolve_inst({label,[{u,L}]},_,_,_, _) ->
     {label,L};
-resolve_inst(FuncInfo,_,_,_) when element(1, FuncInfo) =:= func_info -> 
+resolve_inst(FuncInfo,_,_,_,_) when element(1, FuncInfo) =:= func_info -> 
     FuncInfo; % already resolved
-%% resolve_inst(int_code_end,_,_,_,_) ->  % instruction already handled
-%%    int_code_end;                       % should not really be handled here
-resolve_inst({call,[{u,N},{f,L}]},_,_,Lbls) ->
-    {call,N,lookup(L,Lbls)};
-resolve_inst({call_last,[{u,N},{f,L},{u,U}]},_,_,Lbls) ->
-    {call_last,N,lookup(L,Lbls),U};
-resolve_inst({call_only,[{u,N},{f,L}]},_,_,Lbls) ->
-    {call_only,N,lookup(L,Lbls)};
-resolve_inst({call_ext,[{u,N},{u,MFAix}]},Imports,_,_) ->
+%% resolve_inst(int_code_end,_,_,_,_,_) ->  % instruction already handled
+%%    int_code_end;                         % should not really be handled here
+resolve_inst({call,[{u,N},{f,L}]},_,_,Lbls,_) ->
+    {comment,
+     {call,N,{f,L}},
+     lookup(L,Lbls)};
+resolve_inst({call_last,[{u,N},{f,L},{u,U}]},_,_,Lbls,_) ->
+    {comment,
+     {call_last,N,{f,L},U},
+     lookup(L,Lbls)};
+resolve_inst({call_only,[{u,N},{f,L}]},_,_,Lbls,_) ->
+    {comment,
+     {call_only,N,{f,L}},
+     lookup(L,Lbls)};
+resolve_inst({call_ext,[{u,N},{u,MFAix}]},Imports,_,_,_) ->
     {call_ext,N,lookup(MFAix+1,Imports)};
-resolve_inst({call_ext_last,[{u,N},{u,MFAix},{u,X}]},Imports,_,_) ->
+resolve_inst({call_ext_last,[{u,N},{u,MFAix},{u,X}]},Imports,_,_,_) ->
     {call_ext_last,N,lookup(MFAix+1,Imports),X};
-resolve_inst({bif0,Args},Imports,_,_) ->
+resolve_inst({bif0,Args},Imports,_,_,_) ->
     [Bif,Reg] = resolve_args(Args),
     {extfunc,_Mod,BifName,_Arity} = lookup(Bif+1,Imports),
-    {bif,BifName,nofail,[],Reg};
-resolve_inst({bif1,Args},Imports,_,_) ->
+    {bif,BifName,{f,0},[],Reg};
+resolve_inst({bif1,Args},Imports,_,_,_) ->
     [F,Bif,A1,Reg] = resolve_args(Args),
     {extfunc,_Mod,BifName,_Arity} = lookup(Bif+1,Imports),
     {bif,BifName,F,[A1],Reg};
-resolve_inst({bif2,Args},Imports,_,_) ->
+resolve_inst({bif2,Args},Imports,_,_,_) ->
     [F,Bif,A1,A2,Reg] = resolve_args(Args),
     {extfunc,_Mod,BifName,_Arity} = lookup(Bif+1,Imports),
     {bif,BifName,F,[A1,A2],Reg};
-resolve_inst({allocate,[{u,X0},{u,X1}]},_,_,_) ->
+resolve_inst({allocate,[{u,X0},{u,X1}]},_,_,_,_) ->
     {allocate,X0,X1};
-resolve_inst({allocate_heap,[{u,X0},{u,X1},{u,X2}]},_,_,_) ->
+resolve_inst({allocate_heap,[{u,X0},{u,X1},{u,X2}]},_,_,_,_) ->
     {allocate_heap,X0,X1,X2};
-resolve_inst({allocate_zero,[{u,X0},{u,X1}]},_,_,_) ->
+resolve_inst({allocate_zero,[{u,X0},{u,X1}]},_,_,_,_) ->
     {allocate_zero,X0,X1};
-resolve_inst({allocate_heap_zero,[{u,X0},{u,X1},{u,X2}]},_,_,_) ->
+resolve_inst({allocate_heap_zero,[{u,X0},{u,X1},{u,X2}]},_,_,_,_) ->
     {allocate_heap_zero,X0,X1,X2};
-resolve_inst({test_heap,[{u,X0},{u,X1}]},_,_,_) ->
+resolve_inst({test_heap,[{u,X0},{u,X1}]},_,_,_,_) ->
     {test_heap,X0,X1};
-resolve_inst({init,[Dst]},_,_,_) ->
+resolve_inst({init,[Dst]},_,_,_,_) ->
     {init,Dst};
-resolve_inst({deallocate,[{u,L}]},_,_,_) ->
+resolve_inst({deallocate,[{u,L}]},_,_,_,_) ->
     {deallocate,L};
-resolve_inst({return,[]},_,_,_) ->
+resolve_inst({return,[]},_,_,_,_) ->
     return;
-resolve_inst({send,[]},_,_,_) ->
+resolve_inst({send,[]},_,_,_,_) ->
     send;
-resolve_inst({remove_message,[]},_,_,_) ->
+resolve_inst({remove_message,[]},_,_,_,_) ->
     remove_message;
-resolve_inst({timeout,[]},_,_,_) ->
+resolve_inst({timeout,[]},_,_,_,_) ->
     timeout;
-resolve_inst({loop_rec,[Lbl,Dst]},_,_,_) ->
+resolve_inst({loop_rec,[Lbl,Dst]},_,_,_,_) ->
     {loop_rec,Lbl,Dst};
-resolve_inst({loop_rec_end,[Lbl]},_,_,_) ->
+resolve_inst({loop_rec_end,[Lbl]},_,_,_,_) ->
     {loop_rec_end,Lbl};
-resolve_inst({wait,[Lbl]},_,_,_) ->
+resolve_inst({wait,[Lbl]},_,_,_,_) ->
     {wait,Lbl};
-resolve_inst({wait_timeout,[Lbl,Int]},_,_,_) ->
+resolve_inst({wait_timeout,[Lbl,Int]},_,_,_,_) ->
     {wait_timeout,Lbl,resolve_arg(Int)};
-resolve_inst({m_plus,Args},_,_,_) ->
+resolve_inst({m_plus,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'+',W,[SrcR1,SrcR2],DstR};
-resolve_inst({m_minus,Args},_,_,_) ->
+resolve_inst({m_minus,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'-',W,[SrcR1,SrcR2],DstR};
-resolve_inst({m_times,Args},_,_,_) ->
+resolve_inst({m_times,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'*',W,[SrcR1,SrcR2],DstR};
-resolve_inst({m_div,Args},_,_,_) ->
+resolve_inst({m_div,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'/',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_div,Args},_,_,_) ->
+resolve_inst({int_div,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'div',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_rem,Args},_,_,_) ->
+resolve_inst({int_rem,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'rem',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_band,Args},_,_,_) ->
+resolve_inst({int_band,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'band',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_bor,Args},_,_,_) ->
+resolve_inst({int_bor,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'bor',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_bxor,Args},_,_,_) ->
+resolve_inst({int_bxor,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'bxor',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_bsl,Args},_,_,_) ->
+resolve_inst({int_bsl,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'bsl',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_bsr,Args},_,_,_) ->
+resolve_inst({int_bsr,Args},_,_,_,_) ->
     [W,SrcR1,SrcR2,DstR] = resolve_args(Args),
     {arithbif,'bsr',W,[SrcR1,SrcR2],DstR};
-resolve_inst({int_bnot,Args},_,_,_) ->
+resolve_inst({int_bnot,Args},_,_,_,_) ->
     [W,SrcR,DstR] = resolve_args(Args),
     {arithbif,'bnot',W,[SrcR],DstR};
-resolve_inst({is_lt=I,Args0},_,_,_) ->
+resolve_inst({is_lt=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_ge=I,Args0},_,_,_) ->
+resolve_inst({is_ge=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_eq=I,Args0},_,_,_) ->
+resolve_inst({is_eq=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_ne=I,Args0},_,_,_) ->
+resolve_inst({is_ne=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_eq_exact=I,Args0},_,_,_) ->
+resolve_inst({is_eq_exact=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_ne_exact=I,Args0},_,_,_) ->
+resolve_inst({is_ne_exact=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_integer=I,Args0},_,_,_) ->
+resolve_inst({is_integer=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_float=I,Args0},_,_,_) ->
+resolve_inst({is_float=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_number=I,Args0},_,_,_) ->
+resolve_inst({is_number=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_atom=I,Args0},_,_,_) ->
+resolve_inst({is_atom=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_pid=I,Args0},_,_,_) ->
+resolve_inst({is_pid=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_reference=I,Args0},_,_,_) ->
+resolve_inst({is_reference=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_port=I,Args0},_,_,_) ->
+resolve_inst({is_port=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_nil=I,Args0},_,_,_) ->
+resolve_inst({is_nil=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_binary=I,Args0},_,_,_) ->
+resolve_inst({is_binary=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_constant=I,Args0},_,_,_) ->
+resolve_inst({is_constant=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_list=I,Args0},_,_,_) ->
+resolve_inst({is_list=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_nonempty_list=I,Args0},_,_,_) ->
+resolve_inst({is_nonempty_list=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({is_tuple=I,Args0},_,_,_) ->
+resolve_inst({is_tuple=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({test_arity=I,Args0},_,_,_) ->
+resolve_inst({test_arity=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({select_val,Args},_,_,_) ->
+resolve_inst({select_val,Args},_,_,_,_) ->
     [Reg,FLbl,{{z,1},{u,_Len},List0}] = Args,
     List = resolve_args(List0),
     {select_val,Reg,FLbl,{list,List}};
-resolve_inst({select_tuple_arity,Args},_,_,_) ->
+resolve_inst({select_tuple_arity,Args},_,_,_,_) ->
     [Reg,FLbl,{{z,1},{u,_Len},List0}] = Args,
     List = resolve_args(List0),
     {select_tuple_arity,Reg,FLbl,{list,List}};
-resolve_inst({jump,[Lbl]},_,_,_) ->
+resolve_inst({jump,[Lbl]},_,_,_,_) ->
     {jump,Lbl};
-resolve_inst({'catch',[Dst,Lbl]},_,_,_) ->
+resolve_inst({'catch',[Dst,Lbl]},_,_,_,_) ->
     {'catch',Dst,Lbl};
-resolve_inst({catch_end,[Dst]},_,_,_) ->
+resolve_inst({catch_end,[Dst]},_,_,_,_) ->
     {catch_end,Dst};
-resolve_inst({move,[Src,Dst]},_,_,_) ->
+resolve_inst({move,[Src,Dst]},_,_,_,_) ->
     {move,resolve_arg(Src),Dst};
-resolve_inst({get_list,[Src,Dst1,Dst2]},_,_,_) ->
+resolve_inst({get_list,[Src,Dst1,Dst2]},_,_,_,_) ->
     {get_list,Src,Dst1,Dst2};
-resolve_inst({get_tuple_element,[Src,{u,Off},Dst]},_,_,_) ->
+resolve_inst({get_tuple_element,[Src,{u,Off},Dst]},_,_,_,_) ->
     {get_tuple_element,resolve_arg(Src),Off,resolve_arg(Dst)};
-resolve_inst({set_tuple_element,[Src,Dst,{u,Off}]},_,_,_) ->
+resolve_inst({set_tuple_element,[Src,Dst,{u,Off}]},_,_,_,_) ->
     {set_tuple_element,resolve_arg(Src),resolve_arg(Dst),Off};
-resolve_inst({put_string,[{u,Len},{u,Off},Dst]},_,Strings,_) ->
+resolve_inst({put_string,[{u,Len},{u,Off},Dst]},_,Strings,_,_) ->
     String = if Len > 0 -> binary_to_list(Strings, Off+1, Off+Len);
 		true -> ""
 	     end,
     {put_string,Len,{string,String},Dst};
-resolve_inst({put_list,[Src1,Src2,Dst]},_,_,_) ->
+resolve_inst({put_list,[Src1,Src2,Dst]},_,_,_,_) ->
     {put_list,resolve_arg(Src1),resolve_arg(Src2),Dst};
-resolve_inst({put_tuple,[{u,Arity},Dst]},_,_,_) ->
+resolve_inst({put_tuple,[{u,Arity},Dst]},_,_,_,_) ->
     {put_tuple,Arity,Dst};
-resolve_inst({put,[Src]},_,_,_) ->
+resolve_inst({put,[Src]},_,_,_,_) ->
     {put,resolve_arg(Src)};
-resolve_inst({badmatch,[X]},_,_,_) ->
+resolve_inst({badmatch,[X]},_,_,_,_) ->
     {badmatch,resolve_arg(X)};
-resolve_inst({if_end,[]},_,_,_) ->
+resolve_inst({if_end,[]},_,_,_,_) ->
     if_end;
-resolve_inst({case_end,[X]},_,_,_) ->
+resolve_inst({case_end,[X]},_,_,_,_) ->
     {case_end,resolve_arg(X)};
-resolve_inst({call_fun,[{u,N}]},_,_,_) ->
+resolve_inst({call_fun,[{u,N}]},_,_,_,_) ->
     {call_fun,N};
-resolve_inst({make_fun,Args},_,_,Lbls) ->
+resolve_inst({make_fun,Args},_,_,Lbls,_) ->
     [{f,L},Magic,FreeVars] = resolve_args(Args),
     {make_fun,lookup(L,Lbls),Magic,FreeVars};
-resolve_inst({is_function=I,Args0},_,_,_) ->
+resolve_inst({is_function=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
-resolve_inst({call_ext_only,[{u,N},{u,MFAix}]},Imports,_,_) ->
+resolve_inst({call_ext_only,[{u,N},{u,MFAix}]},Imports,_,_,_) ->
     {call_ext_only,N,lookup(MFAix+1,Imports)};
 %%
 %% Instructions for handling binaries added in R7A & R7B
 %%
-resolve_inst({bs_start_match,[F,Reg]},_,_,_) ->
+resolve_inst({bs_start_match,[F,Reg]},_,_,_,_) ->
     {bs_start_match,F,Reg};
-resolve_inst({bs_get_integer=I,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_get_integer=I,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
     {test,I,Lbl,[A2,N,decode_field_flags(U),A5]};
-resolve_inst({bs_get_float=I,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_get_float=I,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
     {test,I,Lbl,[A2,N,decode_field_flags(U),A5]};
-resolve_inst({bs_get_binary=I,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_get_binary=I,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
     {test,I,Lbl,[A2,N,decode_field_flags(U),A5]};
-resolve_inst({bs_skip_bits,[Lbl,Arg2,{u,N},{u,U}]},_,_,_) ->
+resolve_inst({bs_skip_bits,[Lbl,Arg2,{u,N},{u,U}]},_,_,_,_) ->
     A2 = resolve_arg(Arg2),
     {test,bs_skip_bits,Lbl,[A2,N,decode_field_flags(U)]};
-resolve_inst({bs_test_tail,[F,{u,N}]},_,_,_) ->
+resolve_inst({bs_test_tail,[F,{u,N}]},_,_,_,_) ->
     {test,bs_test_tail,F,[N]};
-resolve_inst({bs_save,[{u,N}]},_,_,_) ->
+resolve_inst({bs_save,[{u,N}]},_,_,_,_) ->
     {bs_save,N};
-resolve_inst({bs_restore,[{u,N}]},_,_,_) ->
+resolve_inst({bs_restore,[{u,N}]},_,_,_,_) ->
     {bs_restore,N};
-resolve_inst({bs_init,[{u,N},{u,U}]},_,_,_) ->
+resolve_inst({bs_init,[{u,N},{u,U}]},_,_,_,_) ->
     {bs_init,N,decode_field_flags(U)};
-resolve_inst({bs_final,[F,X]},_,_,_) ->
+resolve_inst({bs_final,[F,X]},_,_,_,_) ->
     {bs_final,F,X};
-resolve_inst({bs_put_integer,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_put_integer,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
     {bs_put_integer,Lbl,A2,N,decode_field_flags(U),A5};
-resolve_inst({bs_put_binary,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_put_binary,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
     {bs_put_binary,Lbl,A2,N,decode_field_flags(U),A5};
-resolve_inst({bs_put_float,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_put_float,[Lbl,Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
     {bs_put_float,Lbl,A2,N,decode_field_flags(U),A5};
-resolve_inst({bs_put_string,[{u,Len},{u,Off}]},_,Strings,_) ->
+resolve_inst({bs_put_string,[{u,Len},{u,Off}]},_,Strings,_,_) ->
     String = if Len > 0 -> binary_to_list(Strings, Off+1, Off+Len);
 		true -> ""
 	     end,
     {bs_put_string,Len,{string,String}};
-resolve_inst({bs_need_buf,[{u,N}]},_,_,_) ->
+resolve_inst({bs_need_buf,[{u,N}]},_,_,_,_) ->
     {bs_need_buf,N};
 
 %%
 %% Instructions for handling floating point numbers added in June 2001 (R8).
 %%
-resolve_inst({fclearerror,[]},_,_,_) ->
+resolve_inst({fclearerror,[]},_,_,_,_) ->
     fclearerror;
-resolve_inst({fcheckerror,[Arg]},_,_,_) ->
+resolve_inst({fcheckerror,[Arg]},_,_,_,_) ->
     {fcheckerror,resolve_arg(Arg)};
-resolve_inst({fmove,Args},_,_,_) ->
+resolve_inst({fmove,Args},_,_,_,_) ->
     [FR,Reg] = resolve_args(Args),
     {fmove,FR,Reg};
-resolve_inst({fconv,Args},_,_,_) ->
+resolve_inst({fconv,Args},_,_,_,_) ->
     [Reg,FR] = resolve_args(Args),
     {fconv,Reg,FR};
-resolve_inst({fadd=I,Args},_,_,_) ->
+resolve_inst({fadd=I,Args},_,_,_,_) ->
     [F,A1,A2,Reg] = resolve_args(Args),
-    {arithfbif,I,F,[A1,A2],Reg};
-resolve_inst({fsub=I,Args},_,_,_) ->
+    {bif,I,F,[A1,A2],Reg};
+resolve_inst({fsub=I,Args},_,_,_,_) ->
     [F,A1,A2,Reg] = resolve_args(Args),
-    {arithfbif,I,F,[A1,A2],Reg};
-resolve_inst({fmul=I,Args},_,_,_) ->
+    {bif,I,F,[A1,A2],Reg};
+resolve_inst({fmul=I,Args},_,_,_,_) ->
     [F,A1,A2,Reg] = resolve_args(Args),
-    {arithfbif,I,F,[A1,A2],Reg};
-resolve_inst({fdiv=I,Args},_,_,_) ->
+    {bif,I,F,[A1,A2],Reg};
+resolve_inst({fdiv=I,Args},_,_,_,_) ->
     [F,A1,A2,Reg] = resolve_args(Args),
-    {arithfbif,I,F,[A1,A2],Reg};
-resolve_inst({fnegate,Args},_,_,_) ->
+    {bif,I,F,[A1,A2],Reg};
+resolve_inst({fnegate,Args},_,_,_,_) ->
     [F,Arg,Reg] = resolve_args(Args),
-    {arithfbif,fnegate,F,[Arg],Reg};
+    {bif,fnegate,F,[Arg],Reg};
 
 %%
 %% Instructions for try expressions added in January 2003 (R10).
 %%
-resolve_inst({'try',[Reg,Lbl]},_,_,_) -> % analogous to 'catch'
+resolve_inst({'try',[Reg,Lbl]},_,_,_,_) -> % analogous to 'catch'
     {'try',Reg,Lbl};
-resolve_inst({try_end,[Reg]},_,_,_) ->   % analogous to 'catch_end'
+resolve_inst({try_end,[Reg]},_,_,_,_) ->   % analogous to 'catch_end'
     {try_end,Reg};
-resolve_inst({try_case,[Reg]},_,_,_) ->  % analogous to 'catch_end'
+resolve_inst({try_case,[Reg]},_,_,_,_) ->  % analogous to 'catch_end'
     {try_case,Reg};
-resolve_inst({try_case_end,[Arg]},_,_,_) ->
+resolve_inst({try_case_end,[Arg]},_,_,_,_) ->
     {try_case_end,resolve_arg(Arg)};
-resolve_inst({raise,[_Reg1,_Reg2]=Regs},_,_,_) ->
-    {raise,{f,0},Regs,{x,0}};		 % do NOT wrap this as a 'bif'
+resolve_inst({raise,[_Reg1,_Reg2]=Regs},_,_,_,_) ->
+    {bif, raise,{f,0},Regs,{x,0}};		 % do NOT wrap this as a 'bif'
 					 % as there is no raise/2 bif!
 
 %%
 %% New bit syntax instructions added in February 2004 (R10B).
 %%
-resolve_inst({bs_init2,[Lbl,Arg2,{u,W},{u,R},{u,F},Arg6]},_,_,_) ->
+resolve_inst({bs_init2,[Lbl,Arg2,{u,W},{u,R},{u,F},Arg6]},_,_,_,_) ->
     [A2,A6] = resolve_args([Arg2,Arg6]),
     {bs_init2,Lbl,A2,W,R,decode_field_flags(F),A6};
-resolve_inst({bs_bits_to_bytes,[Lbl,Arg2,Arg3]},_,_,_) ->
+resolve_inst({bs_bits_to_bytes,[Lbl,Arg2,Arg3]},_,_,_,_) ->
     [A2,A3] = resolve_args([Arg2,Arg3]),
     {bs_bits_to_bytes,Lbl,A2,A3};
-resolve_inst({bs_add=I,[Lbl,Arg2,Arg3,Arg4,Arg5]},_,_,_) ->
+resolve_inst({bs_add=I,[Lbl,Arg2,Arg3,Arg4,Arg5]},_,_,_,_) ->
     [A2,A3,A4,A5] = resolve_args([Arg2,Arg3,Arg4,Arg5]),
     {I,Lbl,[A2,A3,A4],A5};
 
 %%
 %% New apply instructions added in April 2004 (R10B).
 %%
-resolve_inst({apply,[{u,Arity}]},_,_,_) ->
+resolve_inst({apply,[{u,Arity}]},_,_,_,_) ->
     {apply,Arity};
-resolve_inst({apply_last,[{u,Arity},{u,D}]},_,_,_) ->
+resolve_inst({apply_last,[{u,Arity},{u,D}]},_,_,_,_) ->
     {apply_last,Arity,D};
 
 %%
 %% New test instruction added in April 2004 (R10B).
 %%
-resolve_inst({is_boolean=I,Args0},_,_,_) ->
+resolve_inst({is_boolean=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
 
 %%
 %% New instruction added in June 2005.
 %%
-resolve_inst({is_function2=I,Args0},_,_,_) ->
+resolve_inst({is_function2=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
 
 %%
 %% New bit syntax matching added in Dec 2005 (R11B).
 %%
-resolve_inst({bs_start_match2=I,[F,Reg,{u,Live},{u,Max},Ms]},_,_,_) ->
-    {test,I,F,[Reg,Live,Max,Ms]};
-resolve_inst({bs_get_integer2=I,[Lbl,Ms,{u,Live},Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+resolve_inst({bs_start_match2=I,[F,Reg,{u,Live},{u,Max},Ms]},_,_,_,_) ->
+    {test,I,F,Live,[Reg,Max],Ms};
+resolve_inst({bs_get_integer2=I,[Lbl,Ms,{u,Live},Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
-    {test,I,Lbl,[Ms, Live,A2,N,decode_field_flags(U),A5]};
-resolve_inst({bs_get_binary2=I,[Lbl,Ms,{u,Live},Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+    {test,I,Lbl,Live,[Ms,A2,N,decode_field_flags(U)],A5};
+resolve_inst({bs_get_binary2=I,[Lbl,Ms,{u,Live},Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
-    {test,I,Lbl,[Ms, Live,A2,N,decode_field_flags(U),A5]};
-resolve_inst({bs_get_float2=I,[Lbl,Ms,{u,Live},Arg2,{u,N},{u,U},Arg5]},_,_,_) ->
+    {test,I,Lbl,Live,[Ms,A2,N,decode_field_flags(U)],A5};
+resolve_inst({bs_get_float2=I,[Lbl,Ms,{u,Live},Arg2,{u,N},{u,U},Arg5]},_,_,_,_) ->
     [A2,A5] = resolve_args([Arg2,Arg5]),
-    {test,I,Lbl,[Ms, Live,A2,N,decode_field_flags(U),A5]};
-resolve_inst({bs_skip_bits2=I,[Lbl,Ms,Arg2,{u,N},{u,U}]},_,_,_) ->
+    {test,I,Lbl,Live,[Ms,A2,N,decode_field_flags(U)],A5};
+resolve_inst({bs_skip_bits2=I,[Lbl,Ms,Arg2,{u,N},{u,U}]},_,_,_,_) ->
     A2 = resolve_arg(Arg2),
     {test,I,Lbl,[Ms,A2,N,decode_field_flags(U)]};
-resolve_inst({bs_test_tail2=I,[F,Ms,{u,N}]},_,_,_) ->
+resolve_inst({bs_test_tail2=I,[F,Ms,{u,N}]},_,_,_,_) ->
     {test,I,F,[Ms,N]};
-resolve_inst({bs_save2=I,[Ms,{u,N}]},_,_,_) ->
+resolve_inst({bs_save2=I,[Ms,{u,N}]},_,_,_,_) ->
     {I,Ms,N};
-resolve_inst({bs_restore2=I,[Ms,{u,N}]},_,_,_) ->
+resolve_inst({bs_restore2=I,[Ms,{u,N}]},_,_,_,_) ->
     {I,Ms,N};
-resolve_inst({bs_save2=I,[Ms,{atom,_}=Atom]},_,_,_) ->
+resolve_inst({bs_save2=I,[Ms,{atom,_}=Atom]},_,_,_,_) ->
     %% New operand type in R12B.
     {I,Ms,Atom};
-resolve_inst({bs_restore2=I,[Ms,{atom,_}=Atom]},_,_,_) ->
+resolve_inst({bs_restore2=I,[Ms,{atom,_}=Atom]},_,_,_,_) ->
     %% New operand type in R12B.
     {I,Ms,Atom};
 
 %%
 %% New instructions for guard BIFs that may GC. Added in Jan 2006 (R11B).
 %%
-resolve_inst({gc_bif1,Args},Imports,_,_) ->
+resolve_inst({gc_bif1,Args},Imports,_,_,_) ->
     [F,Live,Bif,A1,Reg] = resolve_args(Args),
     {extfunc,_Mod,BifName,_Arity} = lookup(Bif+1,Imports),
     {gc_bif,BifName,F,Live,[A1],Reg};
-resolve_inst({gc_bif2,Args},Imports,_,_) ->
+resolve_inst({gc_bif2,Args},Imports,_,_,_) ->
     [F,Live,Bif,A1,A2,Reg] = resolve_args(Args),
     {extfunc,_Mod,BifName,_Arity} = lookup(Bif+1,Imports),
     {gc_bif,BifName,F,Live,[A1,A2],Reg};
@@ -1032,7 +1057,7 @@ resolve_inst({gc_bif2,Args},Imports,_,_) ->
 %%
 %% New instruction in R14, gc_bif with 3 arguments
 %%
-resolve_inst({gc_bif3,Args},Imports,_,_) ->
+resolve_inst({gc_bif3,Args},Imports,_,_,_) ->
     [F,Live,Bif,A1,A2,A3,Reg] = resolve_args(Args),
     {extfunc,_Mod,BifName,_Arity} = lookup(Bif+1,Imports),
     {gc_bif,BifName,F,Live,[A1,A2,A3],Reg};
@@ -1040,25 +1065,25 @@ resolve_inst({gc_bif3,Args},Imports,_,_) ->
 %%
 %% New instructions for creating non-byte aligned binaries.
 %%
-resolve_inst({bs_final2,[X,Y]},_,_,_) ->
+resolve_inst({bs_final2,[X,Y]},_,_,_,_) ->
     {bs_final2,X,Y};
 
 %%
 %% R11B-5.
 %% 
-resolve_inst({is_bitstr=I,Args0},_,_,_) ->
+resolve_inst({is_bitstr=I,Args0},_,_,_,_) ->
     [L|Args] = resolve_args(Args0),
     {test,I,L,Args};
 
 %%
 %% R12B.
 %%
-resolve_inst({bs_context_to_binary=I,[Reg0]},_,_,_) ->
+resolve_inst({bs_context_to_binary=I,[Reg0]},_,_,_,_) ->
     Reg = resolve_arg(Reg0),
     {I,Reg};
-resolve_inst({bs_test_unit=I,[F,Ms,{u,N}]},_,_,_) ->
+resolve_inst({bs_test_unit=I,[F,Ms,{u,N}]},_,_,_,_) ->
     {test,I,F,[Ms,N]};
-resolve_inst({bs_match_string=I,[F,Ms,{u,Bits},{u,Off}]},_,Strings,_) ->
+resolve_inst({bs_match_string=I,[F,Ms,{u,Bits},{u,Off}]},_,Strings,_,_) ->
     Len = (Bits+7) div 8,
     String = if
 		 Len > 0 -> 
@@ -1066,97 +1091,99 @@ resolve_inst({bs_match_string=I,[F,Ms,{u,Bits},{u,Off}]},_,Strings,_) ->
 		     Bin;
 		 true -> <<>>
 	     end,
-    {test,I,F,[Ms,Bits,String]};
-resolve_inst({bs_init_writable=I,[]},_,_,_) ->
+    {test,I,F,[Ms,Bits,{string, binary_to_list(String)}]};
+resolve_inst({bs_init_writable=I,[]},_,_,_,_) ->
     I;
-resolve_inst({bs_append=I,[Lbl,Arg2,{u,W},{u,R},{u,U},Arg6,{u,F},Arg8]},_,_,_) ->
+resolve_inst({bs_append=I,[Lbl,Arg2,{u,W},{u,R},{u,U},Arg6,{u,F},Arg8]},_,_,_,_) ->
     [A2,A6,A8] = resolve_args([Arg2,Arg6,Arg8]),
     {I,Lbl,A2,W,R,U,A6,decode_field_flags(F),A8};
-resolve_inst({bs_private_append=I,[Lbl,Arg2,{u,U},Arg4,{u,F},Arg6]},_,_,_) ->
+resolve_inst({bs_private_append=I,[Lbl,Arg2,{u,U},Arg4,{u,F},Arg6]},_,_,_,_) ->
     [A2,A4,A6] = resolve_args([Arg2,Arg4,Arg6]),
     {I,Lbl,A2,U,A4,decode_field_flags(F),A6};
-resolve_inst({trim=I,[{u,N},{u,Remaining}]},_,_,_) ->
+resolve_inst({trim=I,[{u,N},{u,Remaining}]},_,_,_,_) ->
     {I,N,Remaining};
-resolve_inst({bs_init_bits,[Lbl,Arg2,{u,W},{u,R},{u,F},Arg6]},_,_,_) ->
+resolve_inst({bs_init_bits,[Lbl,Arg2,{u,W},{u,R},{u,F},Arg6]},_,_,_,_) ->
     [A2,A6] = resolve_args([Arg2,Arg6]),
     {bs_init_bits,Lbl,A2,W,R,decode_field_flags(F),A6};
 
 %%
 %% R12B-5.
 %%
-resolve_inst({bs_get_utf8=I,[Lbl,Arg2,Arg3,{u,U},Arg4]},_,_,_) ->
+resolve_inst({bs_get_utf8=I,[Lbl,Arg2,Arg3,{u,U},Arg4]},_,_,_,_) ->
     [A2,A3,A4] = resolve_args([Arg2,Arg3,Arg4]),
-    {test,I,Lbl,[A2,A3,decode_field_flags(U),A4]};
-resolve_inst({bs_skip_utf8=I,[Lbl,Arg2,Arg3,{u,U}]},_,_,_) ->
+    {test,I,Lbl,A3,[A2,decode_field_flags(U)],A4};
+resolve_inst({bs_skip_utf8=I,[Lbl,Arg2,Arg3,{u,U}]},_,_,_,_) ->
     [A2,A3] = resolve_args([Arg2,Arg3]),
     {test,I,Lbl,[A2,A3,decode_field_flags(U)]};
-resolve_inst({bs_get_utf16=I,[Lbl,Arg2,Arg3,{u,U},Arg4]},_,_,_) ->
+resolve_inst({bs_get_utf16=I,[Lbl,Arg2,Arg3,{u,U},Arg4]},_,_,_,_) ->
     [A2,A3,A4] = resolve_args([Arg2,Arg3,Arg4]),
-    {test,I,Lbl,[A2,A3,decode_field_flags(U),A4]};
-resolve_inst({bs_skip_utf16=I,[Lbl,Arg2,Arg3,{u,U}]},_,_,_) ->
+    {test,I,Lbl,A3,[A2,decode_field_flags(U)],A4};
+resolve_inst({bs_skip_utf16=I,[Lbl,Arg2,Arg3,{u,U}]},_,_,_,_) ->
     [A2,A3] = resolve_args([Arg2,Arg3]),
     {test,I,Lbl,[A2,A3,decode_field_flags(U)]};
-resolve_inst({bs_get_utf32=I,[Lbl,Arg2,Arg3,{u,U},Arg4]},_,_,_) ->
+resolve_inst({bs_get_utf32=I,[Lbl,Arg2,Arg3,{u,U},Arg4]},_,_,_,_) ->
     [A2,A3,A4] = resolve_args([Arg2,Arg3,Arg4]),
-    {test,I,Lbl,[A2,A3,decode_field_flags(U),A4]};
-resolve_inst({bs_skip_utf32=I,[Lbl,Arg2,Arg3,{u,U}]},_,_,_) ->
+    {test,I,Lbl,A3,[A2,decode_field_flags(U)],A4};
+resolve_inst({bs_skip_utf32=I,[Lbl,Arg2,Arg3,{u,U}]},_,_,_,_) ->
     [A2,A3] = resolve_args([Arg2,Arg3]),
     {test,I,Lbl,[A2,A3,decode_field_flags(U)]};
-resolve_inst({bs_utf8_size=I,[Lbl,Arg2,Arg3]},_,_,_) ->
+resolve_inst({bs_utf8_size=I,[Lbl,Arg2,Arg3]},_,_,_,_) ->
     [A2,A3] = resolve_args([Arg2,Arg3]),
     {I,Lbl,A2,A3};
-resolve_inst({bs_put_utf8=I,[Lbl,{u,U},Arg3]},_,_,_) ->
+resolve_inst({bs_put_utf8=I,[Lbl,{u,U},Arg3]},_,_,_,_) ->
     A3 = resolve_arg(Arg3),
     {I,Lbl,decode_field_flags(U),A3};
-resolve_inst({bs_utf16_size=I,[Lbl,Arg2,Arg3]},_,_,_) ->
+resolve_inst({bs_utf16_size=I,[Lbl,Arg2,Arg3]},_,_,_,_) ->
     [A2,A3] = resolve_args([Arg2,Arg3]),
     {I,Lbl,A2,A3};
-resolve_inst({bs_put_utf16=I,[Lbl,{u,U},Arg3]},_,_,_) ->
+resolve_inst({bs_put_utf16=I,[Lbl,{u,U},Arg3]},_,_,_,_) ->
     A3 = resolve_arg(Arg3),
     {I,Lbl,decode_field_flags(U),A3};
-resolve_inst({bs_put_utf32=I,[Lbl,{u,U},Arg3]},_,_,_) ->
+resolve_inst({bs_put_utf32=I,[Lbl,{u,U},Arg3]},_,_,_,_) ->
     A3 = resolve_arg(Arg3),
     {I,Lbl,decode_field_flags(U),A3};
 
 %%
 %% R13B03.
 %%
-resolve_inst({on_load,[]},_,_,_) ->
+resolve_inst({on_load,[]},_,_,_,_) ->
     on_load;
 
 %%
 %% R14A.
 %%
-resolve_inst({recv_mark,[Lbl]},_,_,_) ->
+resolve_inst({recv_mark,[Lbl]},_,_,_,_) ->
     {recv_mark,Lbl};
-resolve_inst({recv_set,[Lbl]},_,_,_) ->
+resolve_inst({recv_set,[Lbl]},_,_,_,_) ->
     {recv_set,Lbl};
 
 %%
 %% R15A.
 %%
-resolve_inst({line,[Index]},_,_,_) ->
-    {line,resolve_arg(Index)};
+resolve_inst({line,[_Index]},_,_,_,undefined) ->
+    {line, []};
+resolve_inst({line,[Index]},_,_,_,Lines) ->
+    {line,lookup(resolve_arg(Index), Lines)};
 
 %%
 %% 17.0
 %%
-resolve_inst({put_map_assoc,Args},_,_,_) ->
+resolve_inst({put_map_assoc,Args},_,_,_,_) ->
     [FLbl,Src,Dst,{u,N},{{z,1},{u,_Len},List0}] = Args,
     List = resolve_args(List0),
     {put_map_assoc,FLbl,Src,Dst,N,{list,List}};
-resolve_inst({put_map_exact,Args},_,_,_) ->
+resolve_inst({put_map_exact,Args},_,_,_,_) ->
     [FLbl,Src,Dst,{u,N},{{z,1},{u,_Len},List0}] = Args,
     List = resolve_args(List0),
     {put_map_exact,FLbl,Src,Dst,N,{list,List}};
-resolve_inst({is_map=I,Args0},_,_,_) ->
+resolve_inst({is_map=I,Args0},_,_,_,_) ->
     [FLbl|Args] = resolve_args(Args0),
     {test,I,FLbl,Args};
-resolve_inst({has_map_fields,Args0},_,_,_) ->
+resolve_inst({has_map_fields,Args0},_,_,_,_) ->
     [FLbl,Src,{{z,1},{u,_Len},List0}] = Args0,
     List = resolve_args(List0),
     {test,has_map_fields,FLbl,Src,{list,List}};
-resolve_inst({get_map_elements,Args0},_,_,_) ->
+resolve_inst({get_map_elements,Args0},_,_,_,_) ->
     [FLbl,Src,{{z,1},{u,_Len},List0}] = Args0,
     List = resolve_args(List0),
     {get_map_elements,FLbl,Src,{list,List}};
@@ -1164,7 +1191,7 @@ resolve_inst({get_map_elements,Args0},_,_,_) ->
 %%
 %% Catches instructions that are not yet handled.
 %%
-resolve_inst(X,_,_,_) -> ?exit({resolve_inst,X}).
+resolve_inst(X,_,_,_,_) -> ?exit({resolve_inst,X}).
 
 %%-----------------------------------------------------------------------
 %% Resolves arguments in a generic way.
@@ -1195,7 +1222,15 @@ resolve_arg_integer({i,N}) when is_integer(N) -> {integer,N}.
 %%-----------------------------------------------------------------------
 
 decode_field_flags(FF) ->
-    {field_flags,FF}.
+    E = case FF band 2 of
+	    2 -> little;
+	    0 -> big
+	end,
+    S = case FF band 4 of
+	    4 -> signed;
+	    0 -> unsigned
+	end,
+    {field_flags, [S,E]}.
 
 %%-----------------------------------------------------------------------
 %% Private Utilities

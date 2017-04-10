@@ -57,6 +57,8 @@ module(Stream, [_|_]=Fs) ->
     %% Form-based abstract format.
     foreach(fun (F) -> io:format(Stream, "~p.\n", [F]) end, Fs).
 
+format_asm([{comment, I, Comment}|Is]) ->
+    [io_lib:format("    ~p. %% ~w\n",[I,Comment])|format_asm(Is)];
 format_asm([{label,L}|Is]) ->
     ["  {label,",integer_to_list(L),"}.\n"|format_asm(Is)];
 format_asm([I|Is]) ->
