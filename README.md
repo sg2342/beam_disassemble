@@ -26,7 +26,7 @@ Usage
     beam_disassemble path/to/beam_file1.beam path/to/beam_file2.beam ...
 ```
 
-disassemble the BEAM file(s) and create `.S` in the current directory.
+disassemble the BEAM(s) and create `.S` file(s) in the current directory.
 `beam_disassemble` will try to validate the results (with`compile:file/2`)
 
 ```
