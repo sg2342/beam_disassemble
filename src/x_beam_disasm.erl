@@ -671,10 +671,10 @@ resolve_names(Fun, Imports, Str, Lbls, Lambdas, Literals, Lines, M) ->
 
 resolve_inst({make_fun2,Args}, _, _, _, Lambdas, _, _, M) ->
     [OldIndex] = resolve_args(Args),
-    {OldIndex,{F,A,Lbl,_Index,_NumFree,_OldUniq}} =
+    {OldIndex,{F,A,Lbl,_Index,NumFree,_OldUniq}} =
 	lists:keyfind(OldIndex, 1, Lambdas),
     {comment,
-     {make_fun2,{f,Lbl}, 0, 0, 0},
+     {make_fun2,{f,Lbl}, 0, 0, NumFree},
      {M,F,A}};
 resolve_inst(Instr, Imports, Str, Lbls, _Lambdas, _Literals, Lines, _M) ->
     %% io:format(?MODULE_STRING":resolve_inst ~p.~n", [Instr]),
