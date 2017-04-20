@@ -73,4 +73,4 @@ does also fail to compile (identical error)
 
 * `wx_object.S` from `lib/wx-1.8/ebin/wx_object.beam` does not validate, but an
 `wx_object.S` created by `erlc -S -I lib/wx-1.8/include lib/wx-1.8/src/wx_object.erl`
-doea also fail to compile (identical error).
+does also fail to compile (identical error).
